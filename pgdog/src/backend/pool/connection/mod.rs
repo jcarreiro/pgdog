@@ -38,6 +38,8 @@ pub mod binding_test;
 pub mod buffer;
 pub mod mirror;
 pub mod multi_shard;
+#[cfg(test)]
+mod reload_test;
 
 use aggregate::Aggregates;
 use binding::Binding;
@@ -51,6 +53,8 @@ pub struct Connection {
     database: String,
     binding: Binding,
     cluster: Option<Cluster>,
+    // `databases::generation()` read just before `cluster` was fetched.
+    generation: u64,
     mirrors: Vec<MirrorHandler>,
     pub_sub: PubSubClient,
 }
@@ -65,6 +69,7 @@ impl Connection {
                 Binding::NotConnected
             },
             cluster: None,
+            generation: 0,
             user: user.to_owned(),
             database: database.to_owned(),
             mirrors: vec![],
@@ -185,16 +190,24 @@ impl Connection {
             return Ok(ParameterStatus::fake());
         }
 
-        match self.try_parameters(request).await {
-            Ok(params) => Ok(params),
-            // Configuration reload may have left the old pools offline before
-            // the new ones were swapped in. Wait for the reload to settle and
-            // retry once against the refreshed cluster.
-            Err(Error::Pool(pool::Error::AllReplicasDown)) => {
-                self.safe_reload().await?;
-                self.try_parameters(request).await
+        // A configuration reload takes the old pools offline. Wait for it to
+        // settle and retry against the refreshed cluster. After the first
+        // retry, keep going only while a reload replaced the pools the failed
+        // attempt used; otherwise those pools really are down.
+        let mut retried = false;
+        loop {
+            let generation = self.generation;
+            match self.try_parameters(request).await {
+                Ok(params) => return Ok(params),
+                Err(err @ Error::Pool(pool::Error::AllReplicasDown)) => {
+                    self.safe_reload().await?;
+                    if retried && self.generation == generation {
+                        return Err(err);
+                    }
+                    retried = true;
+                }
+                Err(err) => return Err(err),
             }
-            Err(err) => Err(err),
         }
     }
 
@@ -388,6 +401,7 @@ impl Connection {
             databases::add(user)?;
         }
 
+        self.generation = databases::generation();
         let databases = databases();
         let cluster = databases.cluster(user)?;
 

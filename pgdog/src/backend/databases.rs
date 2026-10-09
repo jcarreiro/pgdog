@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use futures::future::try_join_all;
@@ -44,6 +45,7 @@ use super::{
 static DATABASES: Lazy<ArcSwap<Databases>> =
     Lazy::new(|| ArcSwap::from_pointee(Databases::default()));
 static LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 pub type DatabasesLock = MutexGuard<'static, RawMutex, ()>;
 
@@ -57,6 +59,14 @@ pub fn lock() -> DatabasesLock {
 /// This allows to access any database proxied by pgDog.
 pub fn databases() -> Arc<Databases> {
     DATABASES.load().clone()
+}
+
+/// Number of times [`replace_databases`] has swapped in a new set of pools.
+///
+/// Read it before [`databases`]: a value that changes afterwards means the
+/// pools you got may have been taken offline.
+pub(crate) fn generation() -> u64 {
+    GENERATION.load(Ordering::Acquire)
 }
 
 /// Replace databases pooler-wide.
@@ -78,6 +88,7 @@ pub fn replace_databases(new_databases: Databases, reload: bool) -> Result<(), E
     // 3. Launch new databases first.
     new_databases.launch();
     DATABASES.store(new_databases);
+    GENERATION.fetch_add(1, Ordering::Release);
     // 4. Shutdown all databases.
     old_databases.shutdown();
 
