@@ -45,8 +45,10 @@ static DATABASES: Lazy<ArcSwap<Databases>> =
     Lazy::new(|| ArcSwap::from_pointee(Databases::default()));
 static LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
+pub type DatabasesLock = MutexGuard<'static, RawMutex, ()>;
+
 /// Sync databases during modification.
-pub fn lock() -> MutexGuard<'static, RawMutex, ()> {
+pub fn lock() -> DatabasesLock {
     LOCK.lock()
 }
 
@@ -93,7 +95,11 @@ pub fn reconnect() -> Result<(), Error> {
 /// Re-create databases from existing config,
 /// preserving connections.
 pub fn reload_from_existing() -> Result<(), Error> {
-    let _lock = lock();
+    reload_from_existing_locked(&lock())
+}
+
+/// [`reload_from_existing`] for a caller that already holds [`lock`].
+fn reload_from_existing_locked(_lock: &DatabasesLock) -> Result<(), Error> {
     let config = config();
     let databases = from_config(&config);
     replace_databases(databases, true)?;
@@ -163,21 +169,23 @@ pub fn reload() -> Result<(), Error> {
 ///
 /// Return true if user can login, false otherwise.
 ///
+/// Holds [`lock`] from the password check through the reload. Concurrent
+/// logins for the same user wait here, then match the password the first
+/// login stored, instead of each rebuilding every pool.
 pub(crate) fn add(user: ConfigUser) -> Result<AuthResult, Error> {
-    fn add_user(user: ConfigUser) -> Result<(), Error> {
+    fn add_user(user: ConfigUser, lock: &DatabasesLock) -> Result<(), Error> {
         debug!(
             r#"adding user "{}" to database "{}" via passthrough auth"#,
             user.name, user.database
         );
 
-        let _lock = lock();
         let mut config = (*config()).clone();
         config.users.add_or_replace(user);
         set(config)?;
-
-        Ok(())
+        reload_from_existing_locked(lock)
     }
 
+    let lock = lock();
     let config = config();
     let existing = config.users.find(&user);
 
@@ -186,8 +194,7 @@ pub(crate) fn add(user: ConfigUser) -> Result<AuthResult, Error> {
         // Password hasn't been set yet.
         if existing.password.is_none() {
             existing.password = user.password.clone();
-            add_user(existing)?;
-            reload_from_existing()?;
+            add_user(existing, &lock)?;
             Ok(AuthResult::Ok)
         } else if existing
             .password
@@ -202,15 +209,13 @@ pub(crate) fn add(user: ConfigUser) -> Result<AuthResult, Error> {
         } else if config.config.general.passthrough_auth.allows_change() {
             // Passwords don't match but we can change it.
             existing.password = user.password.clone();
-            add_user(user)?;
-            reload_from_existing()?;
+            add_user(user, &lock)?;
             Ok(AuthResult::Ok)
         } else {
             Ok(AuthResult::NoPassthroughPasswordChange)
         }
     } else {
-        add_user(user)?;
-        reload_from_existing()?;
+        add_user(user, &lock)?;
         Ok(AuthResult::Ok)
     }
 }
@@ -919,6 +924,39 @@ mod tests {
         let config = crate::config::config();
         let found = config.users.find(&make_user("dave", None));
         assert_eq!(found.unwrap().password, Some("new_pass".to_string()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_concurrent_first_logins_rebuild_once() {
+        setup_config(
+            crate::config::PassthroughAuth::EnabledPlain,
+            vec![make_user("frank", None)],
+        );
+
+        // Hold the lock so every login gets past its entry point before the
+        // first one can store the password.
+        let guard = lock();
+        let logins: Vec<_> = (0..8)
+            .map(|_| {
+                tokio::task::spawn_blocking(|| {
+                    let result = add(make_user("frank", Some("secret")));
+                    (result, databases())
+                })
+            })
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        drop(guard);
+
+        for login in logins {
+            let (result, seen) = login.await.expect("login task");
+            assert!(result.expect("add").is_ok());
+            // A rebuild after a login returns takes the pools that login
+            // holds offline.
+            assert!(
+                Arc::ptr_eq(&seen, &databases()),
+                "pools were rebuilt after a login completed"
+            );
+        }
     }
 
     #[test]
