@@ -25,6 +25,8 @@ pub(crate) struct ClusterConnection {
     // Cluster smart pointer.
     // Swapped at reload time, hence optional.
     cluster: Option<Cluster>,
+    // `databases::generation()` read just before `cluster` was fetched.
+    generation: u64,
     // Cancelled when an admin terminates the cluster (`FORCE_RELOAD`).
     query_cancellation: CancellationToken,
     // Traffic mirrors.
@@ -44,6 +46,12 @@ impl ClusterConnection {
     /// Get cluster reference.
     pub(super) fn cluster(&self) -> Result<&Cluster, Error> {
         self.cluster.as_ref().ok_or(Error::ClusterNotConnected)
+    }
+
+    /// Generation of the pool set the current cluster came from. See
+    /// [`databases::generation`].
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Get mirror references.
@@ -70,6 +78,7 @@ impl ClusterConnection {
     pub(super) fn reload(&mut self) -> Result<(), Error> {
         self.init_passthrough_auth()?;
 
+        self.generation = databases::generation();
         let cluster = databases::databases().cluster(self.identity())?;
         self.cluster = Some(cluster);
         self.query_cancellation = self.cluster()?.get_cancellation_token().child_token();

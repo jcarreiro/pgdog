@@ -276,16 +276,24 @@ impl Connection {
             return Ok(ParameterStatus::fake());
         }
 
-        match self.try_parameters(request).await {
-            Ok(params) => Ok(params),
-            // Configuration reload may have left the old pools offline before
-            // the new ones were swapped in. Wait for the reload to settle and
-            // retry once against the refreshed cluster.
-            Err(Error::Pool(pool::Error::AllReplicasDown)) => {
-                self.safe_reload().await?;
-                self.try_parameters(request).await
+        // A configuration reload takes the old pools offline. Wait for it to
+        // settle and retry against the refreshed cluster. After the first
+        // retry, keep going only while a reload replaced the pools the failed
+        // attempt used; otherwise those pools really are down.
+        let mut retried = false;
+        loop {
+            let generation = self.cluster.generation();
+            match self.try_parameters(request).await {
+                Ok(params) => return Ok(params),
+                Err(err @ Error::Pool(pool::Error::AllReplicasDown)) => {
+                    self.safe_reload().await?;
+                    if retried && self.cluster.generation() == generation {
+                        return Err(err);
+                    }
+                    retried = true;
+                }
+                Err(err) => return Err(err),
             }
-            Err(err) => Err(err),
         }
     }
 
