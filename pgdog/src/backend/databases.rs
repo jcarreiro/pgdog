@@ -42,8 +42,10 @@ static DATABASES: Lazy<ArcSwap<Databases>> =
     Lazy::new(|| ArcSwap::from_pointee(Databases::default()));
 static LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
+pub(crate) type DatabasesLock = MutexGuard<'static, RawMutex, ()>;
+
 /// Sync databases during modification.
-pub(crate) fn lock() -> MutexGuard<'static, RawMutex, ()> {
+pub(crate) fn lock() -> DatabasesLock {
     LOCK.lock()
 }
 
@@ -92,7 +94,11 @@ pub(crate) fn reconnect() -> Result<(), Error> {
 /// Re-create databases from existing config,
 /// preserving connections.
 pub(crate) fn reload_from_existing() -> Result<(), Error> {
-    let _lock = lock();
+    reload_from_existing_locked(&lock())
+}
+
+/// [`reload_from_existing`] for a caller that already holds [`lock`].
+pub(crate) fn reload_from_existing_locked(_lock: &DatabasesLock) -> Result<(), Error> {
     let config = config();
     let databases = from_config(&config);
     replace_databases(databases, true)?;

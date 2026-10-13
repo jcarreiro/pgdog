@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
+use futures::future::join_all;
 use pgdog_config::{
     Config, ConfigAndUsers, Database, General, LoadSchema, PassthroughAuth, Role, User, Users,
 };
+use tokio::spawn;
 
 use crate::auth::AuthResult;
 use crate::backend::databases;
@@ -293,4 +295,28 @@ async fn restore_rejects_disallowed_password_change() {
 
     assert_eq!(result, AuthResult::NoPassthroughPasswordChange);
     assert!(Arc::ptr_eq(&before, &config()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_first_logins_rebuild_pools_once() {
+    setup(PassthroughAuth::EnabledPlain, vec![user(None)]);
+
+    let logins = (0..8).map(|_| {
+        spawn(async {
+            let result = check_or_add(user(Some("pgdog"))).await;
+            (result, databases::databases())
+        })
+    });
+    let logins = join_all(logins).await;
+
+    let pools = databases::databases();
+    for login in logins {
+        let (result, seen) = login.expect("login task");
+        assert_eq!(result.expect("authenticate"), AuthResult::Ok);
+        // A rebuild after a login returns takes that login's pools offline.
+        assert!(
+            Arc::ptr_eq(&seen, &pools),
+            "pools were rebuilt after a login completed"
+        );
+    }
 }

@@ -3,8 +3,11 @@ pub(crate) mod check_db;
 use tracing::debug;
 
 use crate::{
-    backend::{Error, databases::reload_from_existing},
-    config::config,
+    backend::{
+        Error,
+        databases::{DatabasesLock, lock, reload_from_existing_locked},
+    },
+    config::{config, set},
 };
 
 use check_db::check_db;
@@ -20,26 +23,33 @@ pub(crate) async fn check_or_add(user: User) -> Result<AuthResult, Error> {
 
     if let Some(existing) = existing {
         handle_existing_with_check(user, existing, &config.config.general).await
+    } else if check_db(&user).await {
+        store(user)
     } else {
-        if check_db(&user).await {
-            add_new_user(user)?;
-            Ok(AuthResult::Ok)
-        } else {
-            Ok(AuthResult::NoPassthroughDatabaseCheck)
-        }
+        Ok(AuthResult::NoPassthroughDatabaseCheck)
     }
 }
 
 /// Add a user back to the in-memory config after a config reload.
 /// We assume the user keeps a valid password so we don't check it against the database again.
 pub(crate) fn restore_after_reload(user: User) -> Result<AuthResult, Error> {
+    store(user)
+}
+
+/// Store the user's password in the in-memory config and rebuild the pools.
+///
+/// Holds [`lock`] from reading the config through the rebuild. Logins that
+/// race with the same new password wait here, then find it stored and return
+/// without rebuilding again.
+fn store(user: User) -> Result<AuthResult, Error> {
+    let lock = lock();
     let config = config();
     let existing = config.users.find(&user);
 
     if let Some(existing) = existing {
-        handle_existing(user, existing, &config.config.general)
+        handle_existing(user, existing, &config.config.general, &lock)
     } else {
-        add_new_user(user)?;
+        add_new_user(user, &lock)?;
         Ok(AuthResult::Ok)
     }
 }
@@ -53,25 +63,31 @@ async fn handle_existing_with_check(
         || (config.passthrough_auth.allows_change() && !passwords_match(&new, &existing))
     {
         if check_db(&new).await {
-            update_user(new, existing)?;
-            Ok(AuthResult::Ok)
+            store(new)
         } else {
             Ok(AuthResult::NoPassthroughDatabaseCheck)
         }
+    } else if passwords_match(&new, &existing) {
+        Ok(AuthResult::Ok)
     } else {
-        handle_existing(new, existing, config)
+        Ok(AuthResult::NoPassthroughPasswordChange)
     }
 }
 
-fn handle_existing(new: User, existing: User, config: &General) -> Result<AuthResult, Error> {
+fn handle_existing(
+    new: User,
+    existing: User,
+    config: &General,
+    lock: &DatabasesLock,
+) -> Result<AuthResult, Error> {
     if existing.password.is_none() {
-        update_user(new, existing)?;
+        update_user(new, existing, lock)?;
         Ok(AuthResult::Ok)
     } else {
         if passwords_match(&new, &existing) {
             Ok(AuthResult::Ok)
         } else if config.passthrough_auth.allows_change() {
-            update_user(new, existing)?;
+            update_user(new, existing, lock)?;
             Ok(AuthResult::Ok)
         } else {
             Ok(AuthResult::NoPassthroughPasswordChange)
@@ -89,29 +105,25 @@ fn passwords_match(new: &User, existing: &User) -> bool {
         })
 }
 
-fn update_user(new: User, mut existing: User) -> Result<(), Error> {
+fn update_user(new: User, mut existing: User, lock: &DatabasesLock) -> Result<(), Error> {
     existing.password = new.password;
-    add(existing)?;
-    reload_from_existing()?;
+    add(existing, lock)?;
+    reload_from_existing_locked(lock)?;
     Ok(())
 }
 
-fn add_new_user(user: User) -> Result<(), Error> {
-    add(user)?;
-    reload_from_existing()?;
+fn add_new_user(user: User, lock: &DatabasesLock) -> Result<(), Error> {
+    add(user, lock)?;
+    reload_from_existing_locked(lock)?;
     Ok(())
 }
 
-fn add(user: User) -> Result<(), Error> {
-    use crate::config::set;
-    use crate::databases::lock;
-
+fn add(user: User, _lock: &DatabasesLock) -> Result<(), Error> {
     debug!(
         r#"adding user "{}" to database "{}" via passthrough auth"#,
         user.name, user.database
     );
 
-    let _lock = lock();
     let mut config = (*config()).clone();
     config.users.add_or_replace(user);
     set(config)?;
